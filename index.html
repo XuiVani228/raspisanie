@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>КонстПК — Расписание (веб) — исправлено</title>
+  <style>
+    :root{font-family:Inter, Roboto, Arial, sans-serif}
+    body{margin:0;background:#f7f8fb;color:#111}
+    .container{max-width:980px;margin:32px auto;padding:20px;background:#fff;border-radius:12px;box-shadow:0 6px 30px rgba(20,20,40,.06)}
+    h1{font-size:20px;margin:0 0 8px}
+    label{font-size:13px;color:#555}
+    select,button{padding:8px 10px;border-radius:8px;border:1px solid #dde;min-height:40px}
+    button{background:#2563eb;color:#fff;border:none;cursor:pointer}
+    button.secondary{background:#e6eefc;color:#034}
+    button:disabled{opacity:.5;cursor:default}
+    .controls{margin:16px 0;display:flex;gap:8px;align-items:center}
+    .card{background:#fff;border-radius:10px;padding:12px;border:1px solid #eef;margin-top:12px}
+    pre{white-space:pre-wrap;font-family:inherit}
+    .muted{color:#666;font-size:13px}
+    .footer{font-size:13px;color:#666;margin-top:12px}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <h1>Веб-версия: Парсер расписания КонстПК (исправлено)</h1>
+    <p class="muted">Файл расписания подгружается автоматически из репозитория. Выберите группу и получите расписание.</p>
+
+    <div style="margin-bottom:16px">
+      <label>Выбор группы</label>
+      <select id="groupSelect"><option value="">— Подождите, загружается файл —</option></select>
+    </div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
+      <button id="btnToday">Сегодня</button>
+      <button id="btnTomorrow" class="secondary">Завтра</button>
+      <button id="btnWeek" class="secondary">На неделю</button>
+    </div>
+
+    <div class="card">
+      <div id="infoArea" class="muted">Загружается файл...</div>
+      <div id="output" style="margin-top:12px"></div>
+    </div>
+
+    <div class="footer">Инструкция: замените файл <code>schedule.xlsx</code> в корне репозитория на актуальное расписание — сайт автоматически подтянет новую версию.</div>
+  </div>
+
+  <script>
+  const WEEKDAYS = ['ПОНЕДЕЛЬНИК','ВТОРНИК','СРЕДА','ЧЕТВЕРГ','ПЯТНИЦА','СУББОТА','ВОСКРЕСЕНЬЕ'];
+
+  let parsedSchedule = {}; 
+  let allGroups = [];
+
+  function byText(v){return (v===null||v===undefined)?'':v.toString().trim();}
+
+  function findGroupsAndSchedule(sheetRows){
+    // improved detection: choose the row with the most "group-like" cells
+    // group-like = starts with 1-2 digits, then a dash and a letter (e.g. "1-А", "2-Б")
+    const strictRe = /^\s*\d{1,2}\s*[-–—]\s*[A-Za-zА-Яа-яЁё].*/u;
+    let bestRow = null; let bestCount = 0;
+    for(let r=0;r<sheetRows.length;r++){
+      const row = sheetRows[r] || [];
+      let cnt = 0;
+      for(let c=0;c<row.length;c++){
+        const cell = byText(row[c]);
+        if(!cell) continue;
+        try{ if(strictRe.test(cell)) cnt++; }catch(e){ /* ignore */ }
+      }
+      if(cnt>bestCount){ bestCount=cnt; bestRow=r; }
+    }
+
+    // fallback: previous looser test
+    if(bestCount < 2){
+      bestRow = null;
+      const loose = /\d[-–—]?\w/iu;
+      for(let r=0;r<sheetRows.length;r++){
+        const row = sheetRows[r] || [];
+        if(row.some(c=>{ const s=byText(c); return s && loose.test(s); })) { bestRow = r; break; }
+      }
+    }
+
+    if(bestRow === null) return {schedule:{}, groups:[]};
+
+    const groupsRow = sheetRows[bestRow];
+    const groupCols = {};
+    const groups = [];
+    for(let c=0;c<groupsRow.length;c++){
+      const raw = byText(groupsRow[c]); if(!raw) continue;
+      const cleaned = raw.replace(/\s+/g,' ').trim().toUpperCase();
+      if(cleaned && strictRe.test(raw)){
+        if(!groupCols[cleaned]){ groupCols[cleaned]=[]; groups.push(cleaned); }
+        groupCols[cleaned].push(c);
+      }
+    }
+
+    // if groups still empty, try looser extraction (cells that look like '1 А' or single-digit + letter)
+    if(groups.length===0){
+      for(let c=0;c<groupsRow.length;c++){
+        const raw = byText(groupsRow[c]); if(!raw) continue;
+        const cleaned = raw.replace(/\s+/g,' ').trim().toUpperCase();
+        if(/^[0-9]{1,2}\s*[А-ЯA-ZЁ].*/iu.test(cleaned) || /^[0-9]{1,2}-?[А-ЯA-ZЁ].*/iu.test(cleaned)){
+          if(!groupCols[cleaned]){ groupCols[cleaned]=[]; groups.push(cleaned); }
+          groupCols[cleaned].push(c);
+        }
+      }
+    }
+
+    // build empty schedule
+    const schedule = {};
+    for(const g of groups) schedule[g] = {};
+
+    // find first row after group row that mentions weekday
+    let dataStart = null;
+    for(let r=bestRow+1;r<sheetRows.length;r++){
+      const first = byText((sheetRows[r]||[])[0]).toUpperCase();
+      if(['ПОНЕДЕЛЬНИК','ВТОРНИК','СРЕДА','ЧЕТВЕРГ','ПЯТНИЦА','СУББОТА'].some(d=>first.includes(d))){ dataStart = r; break; }
+    }
+    if(dataStart===null) return {schedule:{}, groups:[]};
+
+    // parse day blocks
+    for(let r=dataStart; r<sheetRows.length; r++){
+      const first = byText((sheetRows[r]||[])[0]).toUpperCase();
+      let dayName = null;
+      if(first.includes('ПОНЕДЕЛЬНИК')) dayName='ПОНЕДЕЛЬНИК';
+      else if(first.includes('ВТОРНИК')) dayName='ВТОРНИК';
+      else if(first.includes('СРЕДА')) dayName='СРЕДА';
+      else if(first.includes('ЧЕТВЕРГ')) dayName='ЧЕТВЕРГ';
+      else if(first.includes('ПЯТНИЦА')) dayName='ПЯТНИЦА';
+      else if(first.includes('СУББОТА')) dayName='СУББОТА';
+      if(!dayName) continue;
+
+      // For each lesson row below this day header, try to read lessons until next day header or empty area
+      // We'll read pairs: lesson row (subjects/rooms) and teacher row below it.
+      for(let offset=0; offset<40; offset+=2){
+        const lr = r + offset; const tr = lr + 1;
+        if(lr >= sheetRows.length) break;
+        const lessonNumCell = (sheetRows[lr]||[])[1];
+        const lessonNum = parseInt(byText(lessonNumCell)) || null;
+        if(!lessonNum) continue;
+
+        for(const g of groups){
+          const cols = groupCols[g] || [];
+          if(cols.length===0) continue;
+          for(const col of cols){
+            const subject = byText((sheetRows[lr]||[])[col]);
+            const room = byText((sheetRows[lr]||[])[col+1]);
+            const teacher = byText((sheetRows[tr]||[])[col]);
+            if(subject){
+              if(!schedule[g][dayName]) schedule[g][dayName]=[];
+              schedule[g][dayName].push({number:lessonNum, subject:subject, teacher:teacher, room:room, subgroup:0});
+            }
+            // try second subcolumn (some sheets put second sub-subject at col+2)
+            const subject2 = byText((sheetRows[lr]||[])[col+2]);
+            const room2 = byText((sheetRows[lr]||[])[col+3]);
+            const teacher2 = byText((sheetRows[tr]||[])[col+2]);
+            if(subject2){
+              if(!schedule[g][dayName]) schedule[g][dayName]=[];
+              schedule[g][dayName].push({number:lessonNum, subject:subject2, teacher:teacher2, room:room2, subgroup:2});
+            }
+          }
+        }
+      }
+    }
+
+    // postprocess: sort lessons and deduplicate
+    for(const g of Object.keys(schedule)){
+      for(const day of Object.keys(schedule[g])){
+        let lessons = schedule[g][day];
+        const seen = new Set();
+        lessons = lessons.filter(l=>{ const k = [l.number,l.subject,l.room,l.teacher,l.subgroup].join('|'); if(seen.has(k)) return false; seen.add(k); return true; });
+        lessons.sort((a,b)=> (a.number - b.number) || (a.subgroup - b.subgroup));
+        schedule[g][day] = lessons;
+      }
+    }
+
+    return {schedule, groups};
+  }
+
+  const groupSelect = document.getElementById('groupSelect');
+  const infoArea = document.getElementById('infoArea');
+  const output = document.getElementById('output');
+  const btnToday = document.getElementById('btnToday');
+  const btnTomorrow = document.getElementById('btnTomorrow');
+  const btnWeek = document.getElementById('btnWeek');
+
+  async function loadSchedule(){
+    try{
+      const resp = await fetch('schedule.xlsx');
+      if(!resp.ok) throw new Error('HTTP '+resp.status);
+      const data = await resp.arrayBuffer();
+      const workbook = XLSX.read(data, {type:'array'});
+      // pick first sheet that has day names or groups
+      let chosenSheet = workbook.SheetNames[0];
+      for(const name of workbook.SheetNames){
+        if(/\d{2}\.\d{2}\.\d{4}/.test(name) || /РАСПИСАНИЕ/i.test(name)) { chosenSheet = name; break; }
+      }
+      const sheet = workbook.Sheets[chosenSheet];
+      const aoa = XLSX.utils.sheet_to_json(sheet, {header:1, raw:false});
+      const {schedule, groups} = findGroupsAndSchedule(aoa);
+      parsedSchedule = schedule; allGroups = groups;
+      populateGroupSelect(groups);
+      infoArea.textContent = `Готово — найдены группы: ${groups.length}`;
+      console.log('Found groups row and groups:', groups);
+    }catch(err){
+      console.error(err); infoArea.textContent = 'Ошибка загрузки: '+err.message;
+    }
+  }
+
+  function populateGroupSelect(groups){
+    groupSelect.innerHTML = '';
+    const empty = document.createElement('option'); empty.value=''; empty.textContent='— Выберите группу —'; groupSelect.appendChild(empty);
+    groups.sort((a,b)=>a.localeCompare(b,'ru'));
+    for(const g of groups){ const opt=document.createElement('option'); opt.value=g; opt.textContent=g; groupSelect.appendChild(opt); }
+  }
+
+  function formatLesson(lesson){
+    if(!lesson.subject) return `<div>${lesson.number}. <i>Пары нет</i></div>`;
+    const subgroup = lesson.subgroup>0 ? `(${lesson.subgroup} подгр.) ` : '';
+    const teacher = lesson.teacher ? ` ${lesson.teacher}` : '';
+    const room = lesson.room ? ` (${lesson.room})` : '';
+    return `<div><b>${String(lesson.number).padStart(2,' ')}.</b> ${subgroup}${escapeHtml(lesson.subject)}${teacher}${room}</div>`;
+  }
+
+  function escapeHtml(s){ return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+
+  function getSelectedGroup(){ return groupSelect.value || null; }
+
+  function showDayForGroup(dayName){
+    const g = getSelectedGroup(); if(!g){ output.innerHTML='<div class="muted">Выберите группу</div>'; return; }
+    if(!parsedSchedule[g]){ output.innerHTML = `<div class="muted">Для группы ${g} расписание не найдено.</div>`; return; }
+    const lessons = parsedSchedule[g][dayName];
+    if(!lessons || !lessons.length){ output.innerHTML = `<div class="muted">На ${dayName} у группы ${g} пар нет.</div>`; return; }
+    let html = `<div><b>Группа: ${g}</b><br><b>${dayName}</b></div><div style="margin-top:8px">`;
+    for(const ls of lessons) html += formatLesson(ls);
+    html += '</div>';
+    output.innerHTML = html;
+  }
+
+  function showWeekForGroup(){
+    const g = getSelectedGroup(); if(!g){ output.innerHTML='<div class="muted">Выберите группу</div>'; return; }
+    if(!parsedSchedule[g]){ output.innerHTML = `<div class="muted">Для группы ${g} расписание не найдено.</div>`; return; }
+    let html = `<div><b>Группа: ${g}</b><br><b>Расписание на неделю</b></div>`;
+    for(const day of ['ПОНЕДЕЛЬНИК','ВТОРНИК','СРЕДА','ЧЕТВЕРГ','ПЯТНИЦА','СУББОТА']){
+      html += `<div style="margin-top:12px"><b>${day}</b>`;
+      const lessons = parsedSchedule[g][day] || [];
+      if(lessons.length===0) html += `<div class="muted">Пар нет</div>`;
+      else for(const ls of lessons) html += formatLesson(ls);
+      html += `</div>`;
+    }
+    output.innerHTML = html;
+  }
+
+  function todayWeekdayName(){
+    const d = new Date(); const wd = d.getDay();
+    if(wd===0) return 'ВОСКРЕСЕНЬЕ';
+    return ['ПОНЕДЕЛЬНИК','ВТОРНИК','СРЕДА','ЧЕТВЕРГ','ПЯТНИЦА','СУББОТА'][wd-1];
+  }
+
+  function tomorrowWeekdayName(){
+    const now = new Date(); const wd = now.getDay();
+    if((wd===6 && (now.getHours()>16 || (now.getHours()===16 && now.getMinutes()>=30))) || wd===0) return 'ПОНЕДЕЛЬНИК';
+    const t = new Date(now.getTime()+24*3600*1000);
+    const tw = t.getDay(); if(tw===0) return 'ВОСКРЕСЕНЬЕ'; return ['ПОНЕДЕЛЬНИК','ВТОРНИК','СРЕДА','ЧЕТВЕРГ','ПЯТНИЦА','СУББОТА'][tw-1];
+  }
+
+  btnToday.addEventListener('click', ()=>{ let day = todayWeekdayName(); if(day==='ВОСКРЕСЕНЬЕ') day='ПОНЕДЕЛЬНИК'; showDayForGroup(day); });
+  btnTomorrow.addEventListener('click', ()=>{ const day = tomorrowWeekdayName(); showDayForGroup(day); });
+  btnWeek.addEventListener('click', ()=>{ showWeekForGroup(); });
+
+  loadSchedule();
+  </script>
+</body>
+</html>
